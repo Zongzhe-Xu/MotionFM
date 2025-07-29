@@ -3,7 +3,7 @@ from capture24_dataloader import Capture24Dataset  # or your file name
 import os
 
 # Path to the directory containing the .parquet file
-parquet_dir = "../../scratch/besp/shared_data/capture24/capture24_parquets"   
+parquet_dir = "../../../scratch/besp/shared_data/capture24/capture24_parquets"   
 
 # Optionally, just use one file for testing
 single_file = sorted(os.listdir(parquet_dir))[0]
