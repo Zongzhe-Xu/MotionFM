@@ -1,14 +1,23 @@
 #!/bin/bash
 
 # Simple Parallelized NHANES Download Script
-# Usage: ./download_parallel_simple.sh [num_workers] [max_patients]
+# Usage: ./download_parallel_simple.sh [num_workers] [max_patients] [patient_list_file] [--replace]
 # Example: ./download_parallel_simple.sh 4 10  # Use 4 workers, process max 10 patients
+# Example: ./download_parallel_simple.sh 4 10 missing_patients.txt  # Download specific patients
+# Example: ./download_parallel_simple.sh 4 10 incomplete_patients.txt --replace  # Replace existing patients
 
 # Default values
 NUM_WORKERS=${1:-2}  # Default to 2 workers
 MAX_PATIENTS=${2:-5}  # Default to 5 patients
+PATIENT_LIST_FILE=${3:-""}  # Optional file with list of patient IDs to download
+REPLACE_EXISTING=false  # Default to skipping existing patients
+
+# Check for --replace flag
+if [[ "$4" == "--replace" ]]; then
+    REPLACE_EXISTING=true
+fi
+
 TARGET_DIR="./patient_data"
-MAX_TOTAL_SIZE_MB=5000  # 5GB limit - adjust as needed
 
 # Check Python availability - prefer anaconda for pandas
 if command -v python3 &> /dev/null; then
@@ -23,8 +32,13 @@ fi
 echo "=== Simple Parallel NHANES Download ==="
 echo "Workers: $NUM_WORKERS"
 echo "Max patients: $MAX_PATIENTS"
+if [ -n "$PATIENT_LIST_FILE" ]; then
+    echo "Patient list file: $PATIENT_LIST_FILE"
+else
+    echo "Patient list file: None (will download from full list)"
+fi
+echo "Replace existing: $REPLACE_EXISTING"
 echo "Target directory: $TARGET_DIR"
-echo "Size limit: ${MAX_TOTAL_SIZE_MB}MB"
 echo "Using Python: $PYTHON_CMD"
 echo ""
 
@@ -53,22 +67,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR" || exit 1
 
-# Fetch the list of .tar.bz2 links
-echo "Fetching file list..."
-wget -q -O - https://ftp.cdc.gov/pub/pax_h/ | \
-  grep -o 'HREF="[^"]*\.tar\.bz2"' | \
-  sed 's/HREF="\/pub\/pax_h\///g' | \
-  sed 's/"//g' > file_list.txt
+# Check if patient list file is provided
+if [ -n "$PATIENT_LIST_FILE" ]; then
+    # Use provided patient list
+    if [ ! -f "$SCRIPT_DIR/$PATIENT_LIST_FILE" ]; then
+        echo "ERROR: Patient list file '$PATIENT_LIST_FILE' not found"
+        exit 1
+    fi
+    
+    echo "Creating file list from patient list: $PATIENT_LIST_FILE"
+    # Convert patient IDs to .tar.bz2 filenames
+    # Handle both simple patient IDs and tab-separated files with status
+    while read -r line; do
+        # Extract just the patient ID (first column, before any tab or space)
+        patient_id=$(echo "$line" | cut -f1 | tr -d '[:space:]')
+        if [ -n "$patient_id" ]; then
+            echo "${patient_id}.tar.bz2" >> file_list.txt
+        fi
+    done < "$SCRIPT_DIR/$PATIENT_LIST_FILE"
+    
+    echo "Created file list with $(wc -l < file_list.txt) files from patient list"
+else
+    # Fetch the list of .tar.bz2 links from server
+    echo "Fetching file list from server..."
+    wget -q -O - https://ftp.cdc.gov/pub/pax_h/ | \
+      grep -o 'HREF="[^"]*\.tar\.bz2"' | \
+      sed 's/HREF="\/pub\/pax_h\///g' | \
+      sed 's/"//g' > file_list.txt
+fi
 
 # Create a work queue by splitting the file list
 echo "Creating work queue..."
 TOTAL_FILES=$(wc -l < file_list.txt)
-FILES_PER_WORKER=$((TOTAL_FILES / NUM_WORKERS + 1))
+
+echo "Total files to process: $TOTAL_FILES"
 
 for ((i=1; i<=NUM_WORKERS; i++)); do
-    start_line=$(((i-1) * FILES_PER_WORKER + 1))
-    end_line=$((i * FILES_PER_WORKER))
+    # Calculate start and end lines for this worker
+    start_line=$(((i-1) * TOTAL_FILES / NUM_WORKERS + 1))
+    if [ $i -eq $NUM_WORKERS ]; then
+        # Last worker gets remaining files
+        end_line=$TOTAL_FILES
+    else
+        end_line=$((i * TOTAL_FILES / NUM_WORKERS))
+    fi
+    
+    # Extract files for this worker
     sed -n "${start_line},${end_line}p" file_list.txt > "worker_${i}_files.txt"
+    worker_file_count=$(wc -l < "worker_${i}_files.txt")
+    echo "Worker $i: $worker_file_count files (lines ${start_line}-${end_line})"
 done
 
 # Function to convert CSV to Parquet, then delete CSV
@@ -118,6 +165,18 @@ process_patient() {
     local file="$2"
     local patient_id="${file%%.tar.bz2}"
     local start_time=$(date +%s)
+    
+    # Check if patient already exists
+    if [ -d "$patient_id" ]; then
+        if [ "$REPLACE_EXISTING" = true ]; then
+            echo "[Worker $worker_id] Removing existing directory for $patient_id (--replace flag set)"
+            rm -rf "$patient_id"
+        else
+            echo "[Worker $worker_id] Skipping $patient_id (already exists)"
+            echo "$patient_id" >> "skipped_patients.txt"
+            return 0  # Return success to avoid counting as failed attempt
+        fi
+    fi
     
     echo "[Worker $worker_id] Processing $file..."
     
@@ -187,11 +246,16 @@ worker() {
     > "$results_file"
     > "$completed_file"
     
-    echo "[Worker $worker_id] Started with $(wc -l < "$files_list") files"
+    # Initialize skipped patients file (shared across workers)
+    touch "skipped_patients.txt"
+    
+    local total_files=$(wc -l < "$files_list")
+    echo "[Worker $worker_id] Started with $total_files files"
     
     local processed_count=0
     local total_size=0
     local attempted_count=0  # Track total attempts (successful + failed)
+    local skipped_count=0
     
     while read -r file; do
         # Check limits - count ALL attempts, not just successful ones
@@ -200,27 +264,43 @@ worker() {
             break
         fi
         
-        if [ "$(echo "$total_size >= $MAX_TOTAL_SIZE_MB" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-            echo "[Worker $worker_id] Stopping (size limit reached)"
-            break
-        fi
+
         
         # Increment attempt counter BEFORE processing
         ((attempted_count++))
         
         # Process the file
         process_patient "$worker_id" "$file"
-        if [ $? -eq 0 ]; then
-            ((processed_count++))
-            # Get the last result
-            local last_size=$(tail -n1 "$results_file")
-            total_size=$(echo "$total_size + $last_size" | bc -l 2>/dev/null || echo "$total_size")
+        exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            # Check if this was a skip (no size recorded)
+            if [ -s "$results_file" ]; then
+                # This was a successful download
+                ((processed_count++))
+                # Get the last result
+                local last_size=$(tail -n1 "$results_file")
+                total_size=$(echo "$total_size + $last_size" | bc -l 2>/dev/null || echo "$total_size")
+                
+                # Show progress update
+                local progress_percent=$((processed_count * 100 / total_files))
+                echo "[Worker $worker_id] Progress: $processed_count/$total_files files completed (${progress_percent}%)"
+            else
+                # This was a skip
+                ((skipped_count++))
+                local progress_percent=$((attempted_count * 100 / total_files))
+                echo "[Worker $worker_id] Progress: $attempted_count/$total_files files attempted (${progress_percent}%)"
+            fi
         else
             echo "[Worker $worker_id] Failed to process $file (attempt $attempted_count/$MAX_PATIENTS)"
+            
+            # Show progress update even for failed attempts
+            local progress_percent=$((attempted_count * 100 / total_files))
+            echo "[Worker $worker_id] Progress: $attempted_count/$total_files files attempted (${progress_percent}%)"
         fi
     done < "$files_list"
     
-    echo "[Worker $worker_id] Finished - processed $processed_count patients successfully, attempted $attempted_count total, total size: ${total_size}MB"
+    local final_progress_percent=$((processed_count * 100 / total_files))
+    echo "[Worker $worker_id] Finished - processed $processed_count/$total_files patients successfully (${final_progress_percent}%), skipped $skipped_count, attempted $attempted_count total, total size: ${total_size}MB"
 }
 
 # Start workers
