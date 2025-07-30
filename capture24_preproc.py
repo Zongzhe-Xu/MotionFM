@@ -25,8 +25,8 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     # Read using Dask
     df = dd.read_parquet(input_file)
 
-    # Downsample
-    df = df.iloc[::downsampling_ratio].compute()
+    # Downsample within each partition
+    df = df.map_partitions(lambda part: part.iloc[::downsampling_ratio]).compute()
 
     # Parse annotations
     parsed = df['annotation'].apply(parse_annotation)
@@ -36,7 +36,7 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     # Reorder columns
     cols = ['time', 'x', 'y', 'z', 'activity', 'MET']
     if 'annotation' in df.columns:
-        df = df[cols]
+        df = df[cols + ['annotation']]
     else:
         df = df[cols]
 
