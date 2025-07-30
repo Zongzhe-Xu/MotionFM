@@ -25,7 +25,11 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     # Read using Dask
     df = dd.read_parquet(input_file)
 
-    # Downsample within each partition
+    # Get first timestamp (compute only the head)
+    start_time = pd.to_datetime(df.head(1)['time'].iloc[0])
+    start_time_str = start_time.strftime("%Y%m%dT%H%M%S")  # or ISO format
+
+    # Downsample
     df = df.map_partitions(lambda part: part.iloc[::downsampling_ratio]).compute()
 
     # Parse annotations
@@ -33,15 +37,19 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     df['activity'] = parsed.apply(lambda x: x[0])
     df['MET'] = parsed.apply(lambda x: x[1])
 
-    # Reorder columns
-    cols = ['time', 'x', 'y', 'z', 'activity', 'MET']
-    if 'annotation' in df.columns:
-        df = df[cols ]
-    else:
-        df = df[cols]
+    # Drop time and annotation
+    df = df.drop(columns=['time', 'annotation'], errors='ignore')
 
-    # Save to new path
-    output_file = output_dir / input_file.name
+    # Reorder columns if needed
+    cols = ['x', 'y', 'z', 'activity', 'MET']
+    df = df[cols]
+
+    # Construct output filename
+    original_name = input_file.stem  # P010
+    filename = f"{original_name}_start_{start_time_str}_{int(100/downsampling_ratio)}Hz.parquet"
+    output_file = output_dir / filename
+
+    # Save processed parquet
     df.to_parquet(output_file, index=False)
     return output_file
 
