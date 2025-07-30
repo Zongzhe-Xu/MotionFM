@@ -36,7 +36,7 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     # Reorder columns
     cols = ['time', 'x', 'y', 'z', 'activity', 'MET']
     if 'annotation' in df.columns:
-        df = df[cols + ['annotation']]
+        df = df[cols ]
     else:
         df = df[cols]
 
