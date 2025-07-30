@@ -1,8 +1,7 @@
 import os
+import dask.dataframe as dd
 import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
-import pyarrow as pa
 from pathlib import Path
 from tqdm import tqdm
 
@@ -23,10 +22,11 @@ def parse_annotation(annotation_str):
     return activity, met
 
 def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int):
-    df = pd.read_parquet(input_file)
+    # Read using Dask
+    df = dd.read_parquet(input_file)
 
     # Downsample
-    df = df.iloc[::downsampling_ratio].reset_index(drop=True)
+    df = df.iloc[::downsampling_ratio].compute()
 
     # Parse annotations
     parsed = df['annotation'].apply(parse_annotation)
@@ -36,7 +36,7 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     # Reorder columns
     cols = ['time', 'x', 'y', 'z', 'activity', 'MET']
     if 'annotation' in df.columns:
-        df = df[cols + ['annotation']]  # keep raw annotation if desired
+        df = df[cols + ['annotation']]
     else:
         df = df[cols]
 
@@ -45,11 +45,7 @@ def preprocess_file(input_file: Path, output_dir: Path, downsampling_ratio: int)
     df.to_parquet(output_file, index=False)
     return output_file
 
-def preprocess_all(
-    input_dir: str,
-    output_dir: str,
-    downsampling_ratio: int = 2
-):
+def preprocess_all(input_dir: str, output_dir: str, downsampling_ratio: int = 2):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -63,7 +59,7 @@ def preprocess_all(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preprocess Capture24 parquet files")
+    parser = argparse.ArgumentParser(description="Preprocess Capture24 parquet files using Dask")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", type=str, required=True, help="Where to save processed parquets")
     parser.add_argument("--downsample", type=int, default=2, help="Downsampling ratio (e.g., 2 keeps every 2nd row)")
