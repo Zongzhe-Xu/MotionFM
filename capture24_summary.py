@@ -37,14 +37,27 @@ def process_file_dask(fpath: Path):
     return ddf, sampling_freq
 
 def aggregate_to_minute_bin(ddf):
-    return ddf.groupby('relative_minute').agg({
-        'x': 'mean',
-        'y': 'mean',
-        'z': 'mean',
-        'norm': 'mean',
-        'MET': 'mean',
-        'activity': lambda x: x.value_counts().index[0]
-    }).reset_index()
+    def most_frequent_activity(df):
+        return pd.Series({
+            'x': df['x'].mean(),
+            'y': df['y'].mean(),
+            'z': df['z'].mean(),
+            'norm': df['norm'].mean(),
+            'MET': df['MET'].mean(),
+            'activity': df['activity'].mode().iloc[0] if not df['activity'].mode().empty else 'none'
+        })
+
+    # Use apply with meta specification
+    meta = {
+        'x': 'f8',
+        'y': 'f8',
+        'z': 'f8',
+        'norm': 'f8',
+        'MET': 'f8',
+        'activity': 'object'
+    }
+
+    return ddf.groupby('relative_minute').apply(most_frequent_activity, meta=meta).reset_index()
 
 def main(input_dir: str):
     input_dir = Path(input_dir)
