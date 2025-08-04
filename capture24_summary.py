@@ -38,6 +38,7 @@ def process_file_dask(fpath: Path):
 
 def aggregate_to_minute_bin(ddf):
     def most_frequent_activity(df):
+        df = df.drop(columns='relative_minute', errors='ignore')
         return pd.Series({
             'x': df['x'].mean(),
             'y': df['y'].mean(),
@@ -47,7 +48,6 @@ def aggregate_to_minute_bin(ddf):
             'activity': df['activity'].mode().iloc[0] if not df['activity'].mode().empty else 'none'
         })
 
-    # Use apply with meta specification
     meta = {
         'x': 'f8',
         'y': 'f8',
@@ -134,5 +134,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dask-based summary + 1-min heatmaps for Capture24 processed parquets")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with processed Capture24 .parquet files")
     args = parser.parse_args()
+    # shell usage : python capture24_summary.py --input_dir /scratch/besp/shared_data/capture24/processed
 
     main(args.input_dir)
