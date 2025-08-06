@@ -145,6 +145,15 @@ def main(input_dir: str):
     print(f"\nPatient Duration Summary (minutes):")
     print(durations_series.describe())
 
+    # Convert to hours
+    durations_hours = durations_series / 60
+    print(f"\nPatient Duration Summary (hours):")
+    print(durations_hours.describe())
+
+    # Files shorter than 24 hours
+    n_short = (durations_series < 1440).sum()
+    print(f"\nFiles shorter than 24 hours: {n_short} out of {len(durations_series)}")
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Dask-based summary + 1-min heatmaps for Capture24 processed parquets")
