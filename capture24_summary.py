@@ -1,3 +1,5 @@
+# capture24_summary.py
+
 import os
 import dask.dataframe as dd
 import numpy as np
@@ -32,7 +34,6 @@ def process_file_dask(fpath: Path):
     ddf['row_index'] = dd.from_array(np.arange(0, len(ddf)))
     ddf['relative_second'] = (ddf['row_index'] / sampling_freq).astype(int)
     ddf['relative_minute'] = (ddf['row_index'] / (sampling_freq * 60)).astype(int)
-    # ENMO -- Euclidean Norm Minus One
     ddf['norm'] = ((ddf['x']**2 + ddf['y']**2 + ddf['z']**2) - 1).map_partitions(np.sqrt)
     return ddf, sampling_freq
 
@@ -49,15 +50,19 @@ def aggregate_to_minute_bin(ddf):
         })
 
     meta = {
-        'x': 'f8',
-        'y': 'f8',
-        'z': 'f8',
-        'norm': 'f8',
-        'MET': 'f8',
-        'activity': 'object'
+        'x': 'f8', 'y': 'f8', 'z': 'f8', 'norm': 'f8', 'MET': 'f8', 'activity': 'object'
     }
 
     return ddf.groupby('relative_minute').apply(most_frequent_activity, meta=meta).reset_index()
+
+def get_duration_minutes(file_path):
+    try:
+        df = dd.read_parquet(file_path, columns=["x"])
+        duration_minutes = len(df) / (get_sampling_rate_from_filename(file_path.name) * 60)
+        return duration_minutes
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None
 
 def main(input_dir: str):
     input_dir = Path(input_dir)
@@ -68,6 +73,7 @@ def main(input_dir: str):
     all_patient_dfs_stats = []
     activity_heatmap_matrix = []
     met_all = []
+    duration_minutes_all = []
 
     for f in tqdm(files):
         ddf, sampling_freq = process_file_dask(f)
@@ -83,6 +89,11 @@ def main(input_dir: str):
         all_patient_dfs_stats.append(df_stats)
         met_all.append(df_stats['MET'].dropna().values)
 
+        # Duration in minutes
+        duration = get_duration_minutes(f)
+        if duration is not None:
+            duration_minutes_all.append(duration)
+
         # Activity per minute
         activity_counts = df_plot.groupby('relative_minute')['activity'].value_counts().unstack(fill_value=0)
         activity_heatmap_matrix.append(activity_counts)
@@ -90,7 +101,7 @@ def main(input_dir: str):
     # === PLOTTING DATA ===
     df_all_plot = pd.concat(all_patient_dfs_plot, ignore_index=True)
 
-    def make_heatmap(data_col, title):
+    def make_heatmap(data_col):
         pivot = df_all_plot.pivot(index='patient', columns='relative_minute', values=data_col)
         plt.figure(figsize=(18, 6))
         sns.heatmap(pivot, cmap='viridis', cbar_kws={'label': data_col})
@@ -102,7 +113,7 @@ def main(input_dir: str):
         plt.close()
 
     for axis in ['x', 'y', 'z', 'norm']:
-        make_heatmap(axis, axis)
+        make_heatmap(axis)
 
     # === ACTIVITY LABEL HEATMAP ===
     activity_combined = pd.concat(activity_heatmap_matrix).groupby('relative_minute').sum().fillna(0)
@@ -129,11 +140,14 @@ def main(input_dir: str):
     met_vals = np.concatenate(met_all)
     print(f"MET: mean={np.nanmean(met_vals):.3f}, std={np.nanstd(met_vals):.3f}, min={np.nanmin(met_vals):.3f}, max={np.nanmax(met_vals):.3f}")
 
+    # === PATIENT DURATION SUMMARY ===
+    durations_series = pd.Series(duration_minutes_all)
+    print(f"\nPatient Duration Summary (minutes):")
+    print(durations_series.describe())
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Dask-based summary + 1-min heatmaps for Capture24 processed parquets")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with processed Capture24 .parquet files")
     args = parser.parse_args()
-    # shell usage : python capture24_summary.py --input_dir /scratch/besp/shared_data/capture24/processed
-
     main(args.input_dir)
