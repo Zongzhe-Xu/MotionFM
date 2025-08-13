@@ -11,7 +11,9 @@ import argparse
 # ----------------------------
 DEFAULT_ORIG_HZ = 100
 DEFAULT_TARGET_HZ = 20
-DEFAULT_CHUNK_MIN = 15
+DEFAULT_WINDOW_MIN = 60      # 1-hour windows
+DEFAULT_STRIDE_MIN = 15      # 15-minute stride
+DEFAULT_KEEP_TIME = False    # drop 'time' in outputs by default
 
 def parse_annotation(annotation_str):
     """Return (activity, MET) parsed from a semicolon-delimited annotation string."""
@@ -35,17 +37,20 @@ def preprocess_file(
     output_dir: Path,
     original_frequency_hz: int,
     target_frequency_hz: int,
-    chunk_minutes: int,
+    window_minutes: int,
+    stride_minutes: int,
+    keep_time: bool = DEFAULT_KEEP_TIME,
 ):
     """
-    - Downsample to target_frequency_hz via striding (no anti-aliasing).
-    - Split into chunk_minutes windows.
-    - Name each output with the CHUNK start time.
+    Pipeline for one patient/file:
+      - Downsample to target_frequency_hz via striding (no anti-aliasing).
+      - Create overlapping windows of `window_minutes` with step `stride_minutes`.
+      - Name each output with the CHUNK start time.
     """
-    # Read only what we need
+    # Read only necessary columns
     ddf = dd.read_parquet(input_file, columns=["time", "x", "y", "z", "annotation"])
 
-    # Compute downsample ratio (assumes original Hz is correct)
+    # Validate downsample ratio
     if original_frequency_hz % target_frequency_hz != 0:
         raise ValueError(
             f"original_frequency_hz ({original_frequency_hz}) must be an integer multiple "
@@ -53,7 +58,7 @@ def preprocess_file(
         )
     downsample_ratio = original_frequency_hz // target_frequency_hz
 
-    # Downsample within each partition by striding
+    # Downsample within each partition by simple decimation
     ddf_ds = ddf.map_partitions(lambda part: part.iloc[::downsample_ratio])
 
     # Materialize (pandas) AFTER downsampling
@@ -64,22 +69,30 @@ def preprocess_file(
     df["activity"] = parsed.apply(lambda x: x[0])
     df["MET"] = parsed.apply(lambda x: x[1])
 
-    # Reorder (keep 'time' until after chunking)
+    # Ensure ordering and 'time' present before windowing
     cols_order = ["time", "x", "y", "z", "activity", "MET"]
     df = df[[c for c in cols_order if c in df.columns]]
 
-    # Chunking math
-    rows_per_chunk = int(chunk_minutes * 60 * target_frequency_hz)
-    total_chunks = int(np.ceil(len(df) / rows_per_chunk)) if rows_per_chunk > 0 else 0
+    # Window/stride math
+    rows_per_window = int(window_minutes * 60 * target_frequency_hz)
+    step_rows = int(stride_minutes * 60 * target_frequency_hz)
+    if rows_per_window <= 0 or step_rows <= 0:
+        raise ValueError("window_minutes and stride_minutes must be > 0.")
+
+    # Indices for overlapping windows: start=0..(len - window) step stride
+    max_start = max(0, len(df) - rows_per_window)
+    starts = range(0, max_start + 1, step_rows)
 
     original_name = input_file.stem  # e.g., "P010"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for i in range(total_chunks):
-        start = i * rows_per_chunk
-        end = (i + 1) * rows_per_chunk
-        chunk_df = df.iloc[start:end]
+    for i, start in enumerate(starts):
+        end = start + rows_per_window
+        if end > len(df):
+            # skip incomplete trailing window; change to `end = len(df)` if you want partials
+            break
 
+        chunk_df = df.iloc[start:end]
         if chunk_df.empty:
             continue
 
@@ -87,19 +100,35 @@ def preprocess_file(
         try:
             chunk_start_time = pd.to_datetime(chunk_df["time"].iloc[0])
         except Exception:
-            # If time parsing fails, fall back to index-based timestamp
+            # If time parsing fails, fall back to Unix epoch
             chunk_start_time = pd.to_datetime("1970-01-01")
         chunk_start_str = chunk_start_time.strftime("%Y%m%dT%H%M%S")
 
-        # Drop 'time' in saved output (as requested)
-        save_df = chunk_df.drop(columns=["time", "annotation"], errors="ignore")[["x", "y", "z", "activity", "MET"]]
+        # Choose columns to save
+        if keep_time:
+            save_cols = ["time", "x", "y", "z", "activity", "MET"]
+        else:
+            save_cols = ["x", "y", "z", "activity", "MET"]
 
-        # Example name: capture24_P010_start_20161215T020400_20Hz_chunk_0.parquet
-        filename = f"capture24_{original_name}_{chunk_start_str}.parquet"
+        save_df = chunk_df.drop(columns=["annotation"], errors="ignore")[save_cols]
+
+        # Example: capture24_P010_start_20161215T020400_20Hz_win60m_stride15m_idx000.parquet
+        filename = (
+            f"capture24_{original_name}_start_{chunk_start_str}_"
+            f"{target_frequency_hz}Hz_win{window_minutes}m_stride{stride_minutes}m_idx{str(i).zfill(3)}.parquet"
+        )
         (output_dir / filename).parent.mkdir(parents=True, exist_ok=True)
         save_df.to_parquet(output_dir / filename, index=False)
 
-def preprocess_all(input_dir: str, output_dir: str, orig_hz: int, target_hz: int, chunk_min: int):
+def preprocess_all(
+    input_dir: str,
+    output_dir: str,
+    orig_hz: int,
+    target_hz: int,
+    window_min: int,
+    stride_min: int,
+    keep_time: bool = DEFAULT_KEEP_TIME,
+):
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
     files = sorted(in_dir.glob("*.parquet"))
@@ -111,16 +140,22 @@ def preprocess_all(input_dir: str, output_dir: str, orig_hz: int, target_hz: int
             output_dir=out_dir,
             original_frequency_hz=orig_hz,
             target_frequency_hz=target_hz,
-            chunk_minutes=chunk_min,
+            window_minutes=window_min,
+            stride_minutes=stride_min,
+            keep_time=keep_time,
         )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preprocess Capture24 parquets into 15-min 20Hz chunks named by CHUNK start time.")
+    parser = argparse.ArgumentParser(
+        description="Preprocess Capture24 parquets into sliding windows (hourly with 15-min stride by default), named by CHUNK start time."
+    )
     parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", required=True, help="Directory to write processed chunk parquets")
     parser.add_argument("--orig_hz", type=int, default=DEFAULT_ORIG_HZ, help="Original sampling frequency (Hz)")
     parser.add_argument("--target_hz", type=int, default=DEFAULT_TARGET_HZ, help="Target sampling frequency (Hz)")
-    parser.add_argument("--chunk_min", type=int, default=DEFAULT_CHUNK_MIN, help="Chunk length (minutes)")
+    parser.add_argument("--window_min", type=int, default=DEFAULT_WINDOW_MIN, help="Window length (minutes), default 60")
+    parser.add_argument("--stride_min", type=int, default=DEFAULT_STRIDE_MIN, help="Stride length (minutes), default 15")
+    parser.add_argument("--keep_time", action="store_true", help="Include 'time' column in saved files")
     args = parser.parse_args()
 
     preprocess_all(
@@ -128,5 +163,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         orig_hz=args.orig_hz,
         target_hz=args.target_hz,
-        chunk_min=args.chunk_min,
+        window_min=args.window_min,
+        stride_min=args.stride_min,
+        keep_time=args.keep_time,
     )
