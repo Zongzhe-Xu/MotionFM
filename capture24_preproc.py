@@ -182,21 +182,15 @@ def preprocess_file(
         (output_dir / filename).parent.mkdir(parents=True, exist_ok=True)
         save_df.to_parquet(output_dir / filename, index=False)
 
-def preprocess_all(
-    input_dir: str,
-    output_dir: str,
-    orig_hz: int,
-    target_hz: int,
-    window_min: int,
-    stride_min: int,
-    keep_time: bool,
-    sg_window_ms: int,
-    sg_polyorder: int,
-):
+def preprocess_all(input_dir: str, output_dir: str, orig_hz: int, target_hz: int, chunk_min: int, start_index: int):
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
     files = sorted(in_dir.glob("*.parquet"))
     print(f"Found {len(files)} files in {in_dir}")
+
+    # Only process starting from start_index
+    files = files[start_index:]
+    print(f"Starting from file index {start_index} ({len(files)} files to process)")
 
     for f in tqdm(files, desc="Preprocessing"):
         preprocess_file(
@@ -204,32 +198,17 @@ def preprocess_all(
             output_dir=out_dir,
             original_frequency_hz=orig_hz,
             target_frequency_hz=target_hz,
-            window_minutes=window_min,
-            stride_minutes=stride_min,
-            keep_time=keep_time,
-            sg_window_ms=sg_window_ms,
-            sg_polyorder=sg_polyorder,
+            chunk_minutes=chunk_min,
         )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Preprocess Capture24 parquets into sliding windows (hourly, 15-min stride), "
-                    "apply Savitzky–Golay smoothing before downsampling."
-    )
+    parser = argparse.ArgumentParser(description="Preprocess Capture24 parquets into chunks.")
     parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", required=True, help="Directory to write processed chunk parquets")
     parser.add_argument("--orig_hz", type=int, default=DEFAULT_ORIG_HZ, help="Original sampling frequency (Hz)")
     parser.add_argument("--target_hz", type=int, default=DEFAULT_TARGET_HZ, help="Target sampling frequency (Hz)")
-    parser.add_argument("--window_min", type=int, default=DEFAULT_WINDOW_MIN, help="Window length (minutes)")
-    parser.add_argument("--stride_min", type=int, default=DEFAULT_STRIDE_MIN, help="Stride length (minutes)")
-    parser.add_argument("--keep_time", action="store_true", help="Include 'time' column in saved files")
-
-    # SG filter params
-    parser.add_argument("--sg_window_ms", type=int, default=DEFAULT_SG_WINDOW_MS,
-                        help="Savitzky–Golay window length in milliseconds at original Hz (must result in odd samples)")
-    parser.add_argument("--sg_polyorder", type=int, default=DEFAULT_SG_POLYORDER,
-                        help="Savitzky–Golay polynomial order (e.g., 2 or 3)")
-
+    parser.add_argument("--chunk_min", type=int, default=DEFAULT_CHUNK_MIN, help="Chunk length (minutes)")
+    parser.add_argument("--start_index", type=int, default=0, help="Index of file to start at in sorted list")
     args = parser.parse_args()
 
     preprocess_all(
@@ -237,9 +216,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         orig_hz=args.orig_hz,
         target_hz=args.target_hz,
-        window_min=args.window_min,
-        stride_min=args.stride_min,
-        keep_time=args.keep_time,
-        sg_window_ms=args.sg_window_ms,
-        sg_polyorder=args.sg_polyorder,
+        chunk_min=args.chunk_min,
+        start_index=args.start_index,
     )
