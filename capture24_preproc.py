@@ -5,6 +5,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+from scipy.signal import savgol_filter  # <-- SG filter
 
 # ----------------------------
 # Defaults (overridable by CLI)
@@ -15,13 +16,16 @@ DEFAULT_WINDOW_MIN = 60      # 1-hour windows
 DEFAULT_STRIDE_MIN = 15      # 15-minute stride
 DEFAULT_KEEP_TIME = False    # drop 'time' in outputs by default
 
+# Savitzky–Golay defaults (window in milliseconds at ORIGINAL Hz)
+DEFAULT_SG_WINDOW_MS = 250   # ~0.25 s window at 100 Hz -> ~25 samples
+DEFAULT_SG_POLYORDER = 3
+
 def parse_annotation(annotation_str):
     """Return (activity, MET) parsed from a semicolon-delimited annotation string."""
     if not isinstance(annotation_str, str) or annotation_str.strip() == "":
         return "", np.nan
 
     parts = annotation_str.split(";")
-    # activity: take text after first space of first part (adjust if your format differs)
     activity = parts[0].split(" ", 1)[-1].strip() if parts else ""
     met = np.nan
     for p in parts:
@@ -32,6 +36,59 @@ def parse_annotation(annotation_str):
                 met = np.nan
     return activity, met
 
+def _savgol_params(orig_hz: int, window_ms: int, polyorder: int, n_rows: int):
+    """
+    Convert window_ms to a valid odd window length in samples, adapt to small partitions.
+    Ensures window_length >= polyorder+2 (really needs > polyorder and odd).
+    """
+    # ms -> samples at original Hz
+    win = max(3, int(round(window_ms * orig_hz / 1000.0)))
+    if win % 2 == 0:
+        win += 1  # must be odd
+
+    # cannot exceed partition length; keep odd
+    if n_rows <= 2:
+        return None, None  # too small to filter
+    if win > n_rows:
+        win = n_rows - 1 if (n_rows - 1) % 2 == 1 else n_rows - 2
+        if win < 3:
+            return None, None
+
+    po = min(polyorder, win - 1)
+    if po < 1:
+        po = 1
+    return win, po
+
+def savgol_smooth_part(part: pd.DataFrame, orig_hz: int, window_ms: int, polyorder: int) -> pd.DataFrame:
+    """
+    Apply SG smoothing to ['x','y','z'] in a pandas partition at original sampling rate.
+    Uses 'interp' mode to reduce edge artifacts within the partition.
+    """
+    n = len(part)
+    if n == 0:
+        return part
+
+    win, po = _savgol_params(orig_hz, window_ms, polyorder, n)
+    if win is None:
+        # too few samples to filter; just return
+        return part
+
+    for col in ['x', 'y', 'z']:
+        if col in part.columns:
+            vals = pd.to_numeric(part[col], errors='coerce').to_numpy()
+            # Handle all-NaN or mostly-NaN segments gracefully
+            if np.all(np.isnan(vals)):
+                continue
+            # Replace NaNs with nearest valid values for filtering (simple fill)
+            # (Optional) you could do more sophisticated imputation
+            s = pd.Series(vals).interpolate(limit_direction='both').to_numpy()
+            try:
+                part[col] = savgol_filter(s, window_length=win, polyorder=po, mode='interp')
+            except Exception:
+                # Fallback: leave as-is if SG fails
+                pass
+    return part
+
 def preprocess_file(
     input_file: Path,
     output_dir: Path,
@@ -39,13 +96,17 @@ def preprocess_file(
     target_frequency_hz: int,
     window_minutes: int,
     stride_minutes: int,
-    keep_time: bool = DEFAULT_KEEP_TIME,
+    keep_time: bool,
+    sg_window_ms: int,
+    sg_polyorder: int,
 ):
     """
     Pipeline for one patient/file:
-      - Downsample to target_frequency_hz via striding (no anti-aliasing).
-      - Create overlapping windows of `window_minutes` with step `stride_minutes`.
-      - Name each output with the CHUNK start time.
+      - Read ("time","x","y","z","annotation")
+      - Apply Savitzky–Golay smoothing at ORIGINAL Hz
+      - Downsample to target_frequency_hz via striding (no explicit anti-aliasing beyond SG)
+      - Create overlapping windows of `window_minutes` with step `stride_minutes`
+      - Name each output with the CHUNK start time
     """
     # Read only necessary columns
     ddf = dd.read_parquet(input_file, columns=["time", "x", "y", "z", "annotation"])
@@ -58,28 +119,36 @@ def preprocess_file(
         )
     downsample_ratio = original_frequency_hz // target_frequency_hz
 
-    # Downsample within each partition by simple decimation
-    ddf_ds = ddf.map_partitions(lambda part: part.iloc[::downsample_ratio])
+    # 1) Savitzky–Golay smoothing per partition at original Hz
+    ddf_smooth = ddf.map_partitions(
+        savgol_smooth_part,
+        orig_hz=original_frequency_hz,
+        window_ms=sg_window_ms,
+        polyorder=sg_polyorder,
+        meta=ddf  # meta helps Dask know schema
+    )
 
-    # Materialize (pandas) AFTER downsampling
+    # 2) Downsample (decimate) by simple striding AFTER smoothing
+    ddf_ds = ddf_smooth.map_partitions(lambda part: part.iloc[::downsample_ratio])
+
+    # 3) Materialize (pandas) AFTER downsampling
     df = ddf_ds.compute()
 
-    # Parse annotations -> activity, MET (keep 'time' for chunk naming)
+    # 4) Parse annotations -> activity, MET (keep 'time' for chunk naming)
     parsed = df["annotation"].apply(parse_annotation)
     df["activity"] = parsed.apply(lambda x: x[0])
     df["MET"] = parsed.apply(lambda x: x[1])
 
-    # Ensure ordering and 'time' present before windowing
+    # 5) Ensure ordering and 'time' present before windowing
     cols_order = ["time", "x", "y", "z", "activity", "MET"]
     df = df[[c for c in cols_order if c in df.columns]]
 
-    # Window/stride math
+    # 6) Window/stride math (overlapping windows)
     rows_per_window = int(window_minutes * 60 * target_frequency_hz)
     step_rows = int(stride_minutes * 60 * target_frequency_hz)
     if rows_per_window <= 0 or step_rows <= 0:
         raise ValueError("window_minutes and stride_minutes must be > 0.")
 
-    # Indices for overlapping windows: start=0..(len - window) step stride
     max_start = max(0, len(df) - rows_per_window)
     starts = range(0, max_start + 1, step_rows)
 
@@ -89,8 +158,7 @@ def preprocess_file(
     for i, start in enumerate(starts):
         end = start + rows_per_window
         if end > len(df):
-            # skip incomplete trailing window; change to `end = len(df)` if you want partials
-            break
+            break  # skip incomplete trailing window; change if you want partials
 
         chunk_df = df.iloc[start:end]
         if chunk_df.empty:
@@ -100,22 +168,16 @@ def preprocess_file(
         try:
             chunk_start_time = pd.to_datetime(chunk_df["time"].iloc[0])
         except Exception:
-            # If time parsing fails, fall back to Unix epoch
             chunk_start_time = pd.to_datetime("1970-01-01")
         chunk_start_str = chunk_start_time.strftime("%Y%m%dT%H%M%S")
 
         # Choose columns to save
-        if keep_time:
-            save_cols = ["time", "x", "y", "z", "activity", "MET"]
-        else:
-            save_cols = ["x", "y", "z", "activity", "MET"]
-
+        save_cols = ["time", "x", "y", "z", "activity", "MET"] if keep_time else ["x", "y", "z", "activity", "MET"]
         save_df = chunk_df.drop(columns=["annotation"], errors="ignore")[save_cols]
 
-        # Example: capture24_P010_start_20161215T020400_20Hz_win60m_stride15m_idx000.parquet
+        # Example filename
         filename = (
-            f"capture24_{original_name}_start_{chunk_start_str}_"
-            f"{target_frequency_hz}Hz_win{window_minutes}m_stride{stride_minutes}m_idx{str(i).zfill(3)}.parquet"
+            f"capture24_{original_name}_{chunk_start_str}.parquet"
         )
         (output_dir / filename).parent.mkdir(parents=True, exist_ok=True)
         save_df.to_parquet(output_dir / filename, index=False)
@@ -127,7 +189,9 @@ def preprocess_all(
     target_hz: int,
     window_min: int,
     stride_min: int,
-    keep_time: bool = DEFAULT_KEEP_TIME,
+    keep_time: bool,
+    sg_window_ms: int,
+    sg_polyorder: int,
 ):
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
@@ -143,19 +207,29 @@ def preprocess_all(
             window_minutes=window_min,
             stride_minutes=stride_min,
             keep_time=keep_time,
+            sg_window_ms=sg_window_ms,
+            sg_polyorder=sg_polyorder,
         )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Preprocess Capture24 parquets into sliding windows (hourly with 15-min stride by default), named by CHUNK start time."
+        description="Preprocess Capture24 parquets into sliding windows (hourly, 15-min stride), "
+                    "apply Savitzky–Golay smoothing before downsampling."
     )
     parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", required=True, help="Directory to write processed chunk parquets")
     parser.add_argument("--orig_hz", type=int, default=DEFAULT_ORIG_HZ, help="Original sampling frequency (Hz)")
     parser.add_argument("--target_hz", type=int, default=DEFAULT_TARGET_HZ, help="Target sampling frequency (Hz)")
-    parser.add_argument("--window_min", type=int, default=DEFAULT_WINDOW_MIN, help="Window length (minutes), default 60")
-    parser.add_argument("--stride_min", type=int, default=DEFAULT_STRIDE_MIN, help="Stride length (minutes), default 15")
+    parser.add_argument("--window_min", type=int, default=DEFAULT_WINDOW_MIN, help="Window length (minutes)")
+    parser.add_argument("--stride_min", type=int, default=DEFAULT_STRIDE_MIN, help="Stride length (minutes)")
     parser.add_argument("--keep_time", action="store_true", help="Include 'time' column in saved files")
+
+    # SG filter params
+    parser.add_argument("--sg_window_ms", type=int, default=DEFAULT_SG_WINDOW_MS,
+                        help="Savitzky–Golay window length in milliseconds at original Hz (must result in odd samples)")
+    parser.add_argument("--sg_polyorder", type=int, default=DEFAULT_SG_POLYORDER,
+                        help="Savitzky–Golay polynomial order (e.g., 2 or 3)")
+
     args = parser.parse_args()
 
     preprocess_all(
@@ -166,4 +240,6 @@ if __name__ == "__main__":
         window_min=args.window_min,
         stride_min=args.stride_min,
         keep_time=args.keep_time,
+        sg_window_ms=args.sg_window_ms,
+        sg_polyorder=args.sg_polyorder,
     )
