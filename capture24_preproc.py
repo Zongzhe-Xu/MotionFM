@@ -199,17 +199,33 @@ def preprocess_all(input_dir: str, output_dir: str, orig_hz: int, target_hz: int
             output_dir=out_dir,
             original_frequency_hz=orig_hz,
             target_frequency_hz=target_hz,
-            chunk_minutes=chunk_min,
+            window_minutes=window_min,
+            stride_minutes=stride_min,
+            keep_time=keep_time,
+            sg_window_ms=sg_window_ms,
+            sg_polyorder=sg_polyorder,
         )
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preprocess Capture24 parquets into chunks.")
+    parser = argparse.ArgumentParser(
+        description="Preprocess Capture24 parquets into sliding windows (hourly, 15-min stride), "
+                    "apply Savitzky–Golay smoothing before downsampling."
+    )
     parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", required=True, help="Directory to write processed chunk parquets")
     parser.add_argument("--orig_hz", type=int, default=DEFAULT_ORIG_HZ, help="Original sampling frequency (Hz)")
     parser.add_argument("--target_hz", type=int, default=DEFAULT_TARGET_HZ, help="Target sampling frequency (Hz)")
-    parser.add_argument("--chunk_min", type=int, default=DEFAULT_CHUNK_MIN, help="Chunk length (minutes)")
+    parser.add_argument("--window_min", type=int, default=DEFAULT_WINDOW_MIN, help="Window length (minutes)")
+    parser.add_argument("--stride_min", type=int, default=DEFAULT_STRIDE_MIN, help="Stride length (minutes)")
+    parser.add_argument("--keep_time", action="store_true", help="Include 'time' column in saved files")
     parser.add_argument("--start_index", type=int, default=0, help="Index of file to start at in sorted list")
+
+    parser.add_argument("--sg_window_ms", type=int, default=DEFAULT_SG_WINDOW_MS,
+                        help="Savitzky–Golay window length in milliseconds at original Hz (must result in odd samples)")
+    parser.add_argument("--sg_polyorder", type=int, default=DEFAULT_SG_POLYORDER,
+                        help="Savitzky–Golay polynomial order (e.g., 2 or 3)")
+    
     args = parser.parse_args()
 
     preprocess_all(
@@ -217,6 +233,10 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         orig_hz=args.orig_hz,
         target_hz=args.target_hz,
-        chunk_min=args.chunk_min,
-        start_index=args.start_index,
-    )
+        window_min=args.window_min,
+        stride_min=args.stride_min,
+        keep_time=args.keep_time,
+        sg_window_ms=args.sg_window_ms,
+        sg_polyorder=args.sg_polyorder,
+         start_index=args.start_index,
+   )
