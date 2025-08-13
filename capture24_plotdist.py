@@ -1,87 +1,181 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import scipy.stats as stats
+#!/usr/bin/env python3
+import argparse
 from pathlib import Path
 import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
-N_PATIENTS = 10  # Change this to sample more/less patients
+plt.switch_backend("Agg")
 
-data_dir = Path("/scratch/besp/shared_data/capture24/distributions")
-out_dir = Path("./dist_plots_agg")
-out_dir.mkdir(exist_ok=True)
+# ---------- helpers ----------
+def find_patients(folder: Path, raw_suffix: str, sg_suffix: str, fir_suffix: str):
+    """
+    Return mapping: patient -> { 'downsampled': Path|None, 'sg': Path|None, 'fir': Path|None }
+    based on files named {patient}_{suffix}.parquet
+    """
+    mapping = {}
+    for p in folder.glob("*.parquet"):
+        stem = p.stem
+        if "_" not in stem:
+            continue
+        patient, suffix = stem.split("_", 1)
+        entry = mapping.setdefault(patient, {"downsampled": None, "sg": None, "fir": None})
+        if suffix == raw_suffix:
+            entry["downsampled"] = p
+        elif suffix == sg_suffix:
+            entry["sg"] = p
+        elif suffix == fir_suffix:
+            entry["fir"] = p
+    return mapping
 
-def load_xyz(file):
-    return pd.read_parquet(file)[["x", "y", "z"]]
+def load_xyz(path: Path):
+    """Load x,y,z DataFrame; drop NaN/Inf rows for clean distributions."""
+    df = pd.read_parquet(path)
+    cols = [c for c in ["x", "y", "z"] if c in df.columns]
+    if len(cols) < 3:
+        return None
+    df = df[["x", "y", "z"]].astype(float)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    return df
 
-# Identify unique patient IDs
-files = list(data_dir.glob("*_raw.parquet"))
-patient_ids = sorted(set(f.stem.split("_")[0] for f in files))
-sampled_ids = random.sample(patient_ids, min(N_PATIENTS, len(patient_ids)))
+def aggregate_frames(files):
+    """Read a list[Path] into one DataFrame (x,y,z); skip missing/failed."""
+    dfs = []
+    for f in files:
+        if f is None:
+            continue
+        try:
+            df = load_xyz(f)
+            if df is not None and len(df):
+                dfs.append(df)
+        except Exception as e:
+            print(f"  ! Skipping {f.name}: {e}")
+    if len(dfs) == 0:
+        return None
+    return pd.concat(dfs, ignore_index=True)
 
-raw_all, sg_all, fir_all = [], [], []
+def qq_points(a: pd.Series, b: pd.Series, n=2000):
+    """Empirical Q–Q points between two series (same quantile grid)."""
+    a = a.dropna().to_numpy()
+    b = b.dropna().to_numpy()
+    if a.size == 0 or b.size == 0:
+        return np.array([]), np.array([])
+    q = np.linspace(0.01, 0.99, num=min(n, max(50, min(a.size, b.size))))
+    return np.quantile(a, q), np.quantile(b, q)
 
-for pid in sampled_ids:
-    raw_all.append(load_xyz(data_dir / f"{pid}_raw.parquet"))
-    sg_all.append(load_xyz(data_dir / f"{pid}_sg.parquet"))
-    fir_all.append(load_xyz(data_dir / f"{pid}_fir.parquet"))
-
-# Concatenate across patients
-raw_df = pd.concat(raw_all, ignore_index=True)
-sg_df = pd.concat(sg_all, ignore_index=True)
-fir_df = pd.concat(fir_all, ignore_index=True)
-
-def plot_histograms(raw_df, sg_df, fir_df, save_path, bins=100):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    methods = [("Raw", raw_df), ("SG", sg_df), ("FIR", fir_df)]
-    colors = ["black", "blue", "red"]
-
-    for ax, axis in zip(axes, ["x", "y", "z"]):
-        for (label, df), color in zip(methods, colors):
-            ax.hist(df[axis], bins=bins, alpha=0.4, label=label, color=color, density=True)
-        ax.set_title(f"{axis.upper()} distribution")
-        ax.legend()
-
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def plot_qq(raw_df, other_df, method_name, save_path):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, axis in zip(axes, ["x", "y", "z"]):
-        stats.probplot(other_df[axis], dist="norm", plot=ax)
-        ax.set_title(f"Q-Q Plot: {method_name} ({axis.upper()})")
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def summary_stats(df):
-    return {
+def summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Return metrics x/y/z as columns; rows=metrics."""
+    stats = {
+        "count": df.count(),
         "mean": df.mean(),
         "std": df.std(),
-        "skew": df.skew(),
-        "kurt": df.kurtosis(),
         "min": df.min(),
+        "p25": df.quantile(0.25),
+        "p50": df.quantile(0.50),
+        "p75": df.quantile(0.75),
         "max": df.max(),
-        "p5": df.quantile(0.05),
-        "p50": df.quantile(0.5),
-        "p95": df.quantile(0.95)
     }
+    out = pd.DataFrame(stats).T
+    return out[["x", "y", "z"]]
 
-# Histograms
-plot_histograms(raw_df, sg_df, fir_df, out_dir / "histograms_agg.png")
+# ---------- plotting ----------
+def plot_histograms(df_raw, df_sg, df_fir, out_png, bins=120):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+    triplets = [("X", "x"), ("Y", "y"), ("Z", "z")]
+    for ax, (label, col) in zip(axes, triplets):
+        ax.hist(df_raw[col], bins=bins, density=True, alpha=0.45, label="Downsampled", histtype="stepfilled")
+        ax.hist(df_sg[col],  bins=bins, density=True, alpha=0.45, label="SG",            histtype="stepfilled")
+        ax.hist(df_fir[col], bins=bins, density=True, alpha=0.45, label="FIR",           histtype="stepfilled")
+        ax.set_title(f"{label}-axis")
+        ax.set_xlabel("Acceleration")
+        if label == "X":
+            ax.set_ylabel("Density")
+        ax.grid(True, alpha=0.25)
+        ax.legend(frameon=False, fontsize=9)
+    fig.suptitle("Accelerometry Distributions (Aggregated)")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
 
-# Q–Q plots
-plot_qq(raw_df, sg_df, "SG", out_dir / "qq_sg_agg.png")
-plot_qq(raw_df, fir_df, "FIR", out_dir / "qq_fir_agg.png")
+def plot_qq_grid(df_ref, df_cmp, cmp_name, out_png, n=2000):
+    """Three Q–Q plots: cmp vs ref for x/y/z."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
+    for ax, col, label in zip(axes, ["x", "y", "z"], ["X", "Y", "Z"]):
+        qa, qb = qq_points(df_ref[col], df_cmp[col], n=n)
+        if qa.size and qb.size:
+            ax.scatter(qa, qb, s=6, alpha=0.6)
+            lims = [min(qa.min(), qb.min()), max(qa.max(), qb.max())]
+            ax.plot(lims, lims, "k--", linewidth=1)  # 45° line
+        ax.set_title(f"{label}-axis")
+        ax.set_xlabel("Downsampled quantiles")
+        if label == "X":
+            ax.set_ylabel(f"{cmp_name} quantiles")
+        ax.grid(True, alpha=0.25)
+    fig.suptitle(f"Q–Q: {cmp_name} vs Downsampled (Aggregated)")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
 
-# Summary stats
-stats_raw = summary_stats(raw_df)
-stats_sg  = summary_stats(sg_df)
-stats_fir = summary_stats(fir_df)
+# ---------- main ----------
+def main():
+    ap = argparse.ArgumentParser(description="Aggregate accelerometry distributions across patients: histograms, Q–Q, summary stats.")
+    ap.add_argument("--folder", default="/scratch/besp/shared_data/capture24/distributions", help="Folder with *_downsampled/_sg/_fir.parquet")
+    ap.add_argument("--out_dir", default="dist_plots_agg", help="Where to save outputs")
+    ap.add_argument("--raw_suffix", default="downsampled", help="Suffix for raw/downsampled files")
+    ap.add_argument("--sg_suffix", default="sg", help="Suffix for SG files")
+    ap.add_argument("--fir_suffix", default="fir", help="Suffix for FIR files")
+    ap.add_argument("--max_patients", type=int, default=10, help="Sample up to this many patients (0 = all)")
+    ap.add_argument("--seed", type=int, default=0, help="Random seed for patient sampling")
+    args = ap.parse_args()
 
-pd.DataFrame({
-    "Raw": stats_raw,
-    "SG": stats_sg,
-    "FIR": stats_fir
-}).to_csv(out_dir / "summary_stats_agg.csv")
+    folder = Path(args.folder)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mapping = find_patients(folder, args.raw_suffix, args.sg_suffix, args.fir_suffix)
+    patients = sorted(mapping.keys())
+    if args.max_patients > 0:
+        random.seed(args.seed)
+        patients = random.sample(patients, min(args.max_patients, len(patients)))
+
+    # Build file lists
+    raw_files = [mapping[p]["downsampled"] for p in patients if mapping[p]["downsampled"] is not None]
+    sg_files  = [mapping[p]["sg"]          for p in patients if mapping[p]["sg"] is not None]
+    fir_files = [mapping[p]["fir"]         for p in patients if mapping[p]["fir"] is not None]
+
+    print(f"Patients found: {len(mapping)}; using {len(patients)}")
+    print(f"Have files — downsampled: {len(raw_files)}, sg: {len(sg_files)}, fir: {len(fir_files)}")
+
+    # Aggregate data
+    df_raw = aggregate_frames(raw_files)
+    df_sg  = aggregate_frames(sg_files)
+    df_fir = aggregate_frames(fir_files)
+
+    if df_raw is None or df_sg is None or df_fir is None:
+        print("Nothing to aggregate — check suffixes and folder contents.")
+        print("Example names detected in folder:")
+        for p in sorted(folder.glob("*.parquet"))[:20]:
+            print("  ", p.name)
+        return
+
+    # Plots
+    plot_histograms(df_raw, df_sg, df_fir, out_dir / "histograms_agg.png")
+    plot_qq_grid(df_raw, df_sg,  "SG",  out_dir / "qq_sg_agg.png")
+    plot_qq_grid(df_raw, df_fir, "FIR", out_dir / "qq_fir_agg.png")
+
+    # Summary stats CSV
+    stats_raw = summary_table(df_raw)
+    stats_sg  = summary_table(df_sg)
+    stats_fir = summary_table(df_fir)
+    wide = pd.concat(
+        {"Downsampled": stats_raw, "SG": stats_sg, "FIR": stats_fir},
+        axis=1
+    )
+    wide.to_csv(out_dir / "summary_stats_agg.csv")
+    print(f"Saved: {out_dir/'histograms_agg.png'}, {out_dir/'qq_sg_agg.png'}, {out_dir/'qq_fir_agg.png'}, {out_dir/'summary_stats_agg.csv'}")
+
+if __name__ == "__main__":
+    main()
