@@ -15,6 +15,7 @@ DEFAULT_TARGET_HZ = 20
 DEFAULT_WINDOW_MIN = 60      # 1-hour windows
 DEFAULT_STRIDE_MIN = 15      # 15-minute stride
 DEFAULT_KEEP_TIME = False    # drop 'time' in outputs by default
+DEFAULT_CHUNK_MIN = 15 
 
 # Savitzky–Golay defaults (window in milliseconds at ORIGINAL Hz)
 DEFAULT_SG_WINDOW_MS = 250   # ~0.25 s window at 100 Hz -> ~25 samples
