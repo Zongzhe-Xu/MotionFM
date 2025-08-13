@@ -87,11 +87,14 @@ def preprocess_file(
       - Read ("time","x","y","z","annotation")
       - Savitzky–Golay smoothing at ORIGINAL Hz
       - Downsample to target_frequency_hz via striding
+      - Compute ENMO = max(sqrt(x^2+y^2+z^2) - 1, 0)
       - Sliding windows: window_minutes with stride_minutes
       - Filename includes the chunk start time
     """
+    # Read minimal columns
     ddf = dd.read_parquet(input_file, columns=["time", "x", "y", "z", "annotation"])
 
+    # Validate downsample ratio
     if original_frequency_hz % target_frequency_hz != 0:
         raise ValueError(
             f"original_frequency_hz ({original_frequency_hz}) must be an integer multiple "
@@ -99,13 +102,13 @@ def preprocess_file(
         )
     downsample_ratio = original_frequency_hz // target_frequency_hz
 
-    # 1) Smooth at original Hz
+    # 1) Smooth at original Hz (per partition)
     ddf_smooth = ddf.map_partitions(
         savgol_smooth_part,
         orig_hz=original_frequency_hz,
         window_ms=sg_window_ms,
         polyorder=sg_polyorder,
-        meta=ddf
+        meta=ddf,
     )
 
     # 2) Decimate by striding
@@ -119,11 +122,15 @@ def preprocess_file(
     df["activity"] = parsed.apply(lambda x: x[0])
     df["MET"] = parsed.apply(lambda x: x[1])
 
-    # 5) Keep columns & order (keep 'time' for naming before optional drop)
-    cols_order = ["time", "x", "y", "z", "activity", "MET"]
+    # 5) ENMO (Euclidean Norm Minus One), non-negative
+    df["ENMO"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2) - 1.0
+    df["ENMO"] = df["ENMO"].clip(lower=0.0)
+
+    # 6) Keep columns & order (retain 'time' for naming before optional drop)
+    cols_order = ["time", "x", "y", "z", "ENMO", "activity", "MET"]
     df = df[[c for c in cols_order if c in df.columns]]
 
-    # 6) Windowing
+    # 7) Windowing
     rows_per_window = int(window_minutes * 60 * target_frequency_hz)
     step_rows = int(stride_minutes * 60 * target_frequency_hz)
     if rows_per_window <= 0 or step_rows <= 0:
@@ -134,7 +141,7 @@ def preprocess_file(
     original_name = input_file.stem
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, start in enumerate(starts):
+    for start in starts:
         end = start + rows_per_window
         if end > len(df):
             break
@@ -142,18 +149,19 @@ def preprocess_file(
         if chunk_df.empty:
             continue
 
+        # Use chunk start time for filename
         try:
             chunk_start_time = pd.to_datetime(chunk_df["time"].iloc[0])
         except Exception:
             chunk_start_time = pd.to_datetime("1970-01-01")
         chunk_start_str = chunk_start_time.strftime("%Y%m%dT%H%M%S")
 
-        save_cols = ["time", "x", "y", "z", "activity", "MET"] if keep_time else ["x", "y", "z", "activity", "MET"]
+        # Choose columns to save
+        save_cols = (["time"] if keep_time else []) + ["x", "y", "z", "ENMO", "activity", "MET"]
         save_df = chunk_df.drop(columns=["annotation"], errors="ignore")[save_cols]
 
-        filename = (
-            f"capture24_{original_name}_{chunk_start_str}.parquet"
-        )
+        # Write parquet
+        filename = f"capture24_{original_name}_{chunk_start_str}.parquet"
         (output_dir / filename).parent.mkdir(parents=True, exist_ok=True)
         save_df.to_parquet(output_dir / filename, index=False)
 
