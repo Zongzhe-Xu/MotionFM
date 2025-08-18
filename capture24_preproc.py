@@ -1,11 +1,13 @@
-import os
+# capture24_preproc_butter.py
+
+import argparse
+from pathlib import Path
+
 import dask.dataframe as dd
 import pandas as pd
 import numpy as np
-from pathlib import Path
 from tqdm import tqdm
-import argparse
-from scipy.signal import savgol_filter  # <-- SG filter
+from scipy.signal import butter, sosfiltfilt
 
 # ----------------------------
 # Defaults (overridable by CLI)
@@ -16,10 +18,13 @@ DEFAULT_WINDOW_MIN = 60      # 1-hour windows
 DEFAULT_STRIDE_MIN = 15      # 15-minute stride
 DEFAULT_KEEP_TIME = False    # drop 'time' in outputs by default
 
-# Savitzky–Golay defaults (window in milliseconds at ORIGINAL Hz)
-DEFAULT_SG_WINDOW_MS = 250   # ~0.25 s window at 100 Hz -> ~25 samples (odd)
-DEFAULT_SG_POLYORDER = 3
+# Butterworth filter defaults
+DEFAULT_BUTTER_ORDER = 4
+DEFAULT_BUTTER_CUTOFF_HZ = 20.0  # low-pass cutoff at original Hz
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def parse_annotation(annotation_str):
     """Return (activity, MET) parsed from a semicolon-delimited annotation string."""
     if not isinstance(annotation_str, str) or annotation_str.strip() == "":
@@ -35,42 +40,36 @@ def parse_annotation(annotation_str):
                 met = np.nan
     return activity, met
 
-def _savgol_params(orig_hz: int, window_ms: int, polyorder: int, n_rows: int):
-    """Compute valid (odd) window length and polyorder for a partition."""
-    win = max(3, int(round(window_ms * orig_hz / 1000.0)))
-    if win % 2 == 0:
-        win += 1  # must be odd
-    if n_rows <= 2:
-        return None, None
-    if win > n_rows:
-        win = n_rows - 1 if (n_rows - 1) % 2 == 1 else n_rows - 2
-        if win < 3:
-            return None, None
-    po = min(polyorder, win - 1)
-    if po < 1:
-        po = 1
-    return win, po
+def butter_sos(orig_hz: int, cutoff_hz: float, order: int):
+    nyq = 0.5 * orig_hz
+    wn = cutoff_hz / nyq
+    if wn >= 1.0:
+        # Degenerate: no need to filter
+        return None
+    # Use SOS for numerical stability
+    return butter(order, wn, btype="low", output="sos")
 
-def savgol_smooth_part(part: pd.DataFrame, orig_hz: int, window_ms: int, polyorder: int) -> pd.DataFrame:
-    """Apply Savitzky–Golay to x,y,z in a pandas partition at original sampling rate."""
-    n = len(part)
-    if n == 0:
+def butter_lowpass_part(part: pd.DataFrame, sos, cols=("x", "y", "z")) -> pd.DataFrame:
+    """Apply zero-phase Butterworth low-pass (sosfiltfilt) per partition."""
+    if sos is None or len(part) == 0:
         return part
-    win, po = _savgol_params(orig_hz, window_ms, polyorder, n)
-    if win is None:
-        return part
-    for col in ['x', 'y', 'z']:
-        if col in part.columns:
-            vals = pd.to_numeric(part[col], errors='coerce').to_numpy()
+    for c in cols:
+        if c in part.columns:
+            vals = pd.to_numeric(part[c], errors="coerce").to_numpy()
             if np.all(np.isnan(vals)):
                 continue
-            s = pd.Series(vals).interpolate(limit_direction='both').to_numpy()
+            # simple interpolation to handle NaNs
+            s = pd.Series(vals).interpolate(limit_direction="both").to_numpy()
             try:
-                part[col] = savgol_filter(s, window_length=win, polyorder=po, mode='interp')
+                part[c] = sosfiltfilt(sos, s, axis=0)
             except Exception:
+                # if filtfilt fails due to too-short partition, leave as-is
                 pass
     return part
 
+# ----------------------------
+# Core
+# ----------------------------
 def preprocess_file(
     input_file: Path,
     output_dir: Path,
@@ -79,13 +78,13 @@ def preprocess_file(
     window_minutes: int,
     stride_minutes: int,
     keep_time: bool,
-    sg_window_ms: int,
-    sg_polyorder: int,
+    butter_order: int,
+    butter_cutoff_hz: float,
 ):
     """
     For one patient/file:
       - Read ("time","x","y","z","annotation")
-      - Savitzky–Golay smoothing at ORIGINAL Hz
+      - Butterworth low-pass (order=butter_order, cutoff=butter_cutoff_hz) at ORIGINAL Hz (zero-phase)
       - Downsample to target_frequency_hz via striding
       - Compute ENMO = max(sqrt(x^2+y^2+z^2) - 1, 0)
       - Sliding windows: window_minutes with stride_minutes
@@ -102,17 +101,19 @@ def preprocess_file(
         )
     downsample_ratio = original_frequency_hz // target_frequency_hz
 
-    # 1) Smooth at original Hz (per partition)
-    ddf_smooth = ddf.map_partitions(
-        savgol_smooth_part,
-        orig_hz=original_frequency_hz,
-        window_ms=sg_window_ms,
-        polyorder=sg_polyorder,
+    # Precompute SOS once
+    sos = butter_sos(original_frequency_hz, butter_cutoff_hz, butter_order)
+
+    # 1) Low-pass at original Hz (per partition)
+    ddf_filt = ddf.map_partitions(
+        butter_lowpass_part,
+        sos=sos,
+        cols=("x", "y", "z"),
         meta=ddf,
     )
 
     # 2) Decimate by striding
-    ddf_ds = ddf_smooth.map_partitions(lambda part: part.iloc[::downsample_ratio])
+    ddf_ds = ddf_filt.map_partitions(lambda part: part.iloc[::downsample_ratio])
 
     # 3) Compute to pandas
     df = ddf_ds.compute()
@@ -157,7 +158,7 @@ def preprocess_file(
         chunk_start_str = chunk_start_time.strftime("%Y%m%dT%H%M%S")
 
         # Choose columns to save
-        save_cols = (["time"] if keep_time else []) + ["x", "y", "z", "ENMO", "activity", "MET"] ## drop enmo, activity, MET, generate separate labels file for this chunk with activity present
+        save_cols = (["time"] if keep_time else []) + ["x", "y", "z", "ENMO", "activity", "MET"]
         save_df = chunk_df.drop(columns=["annotation"], errors="ignore")[save_cols]
 
         # Write parquet
@@ -173,8 +174,8 @@ def preprocess_all(
     window_min: int,
     stride_min: int,
     keep_time: bool,
-    sg_window_ms: int,
-    sg_polyorder: int,
+    butter_order: int,
+    butter_cutoff_hz: float,
     start_index: int,
 ):
     in_dir = Path(input_dir)
@@ -197,14 +198,17 @@ def preprocess_all(
             window_minutes=window_min,
             stride_minutes=stride_min,
             keep_time=keep_time,
-            sg_window_ms=sg_window_ms,
-            sg_polyorder=sg_polyorder,
+            butter_order=butter_order,
+            butter_cutoff_hz=butter_cutoff_hz,
         )
 
+# ----------------------------
+# CLI
+# ----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Preprocess Capture24 parquets into sliding windows (hourly, 15-min stride), "
-                    "apply Savitzky–Golay smoothing before downsampling."
+                    "apply 4th-order Butterworth low-pass before downsampling."
     )
     parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquets")
     parser.add_argument("--output_dir", required=True, help="Directory to write processed chunk parquets")
@@ -215,11 +219,9 @@ if __name__ == "__main__":
     parser.add_argument("--keep_time", action="store_true", help="Include 'time' column in saved files")
     parser.add_argument("--start_index", type=int, default=0, help="Index of file to start at in sorted list")
 
-    # SG filter params
-    parser.add_argument("--sg_window_ms", type=int, default=DEFAULT_SG_WINDOW_MS,
-                        help="Savitzky–Golay window length in ms at original Hz (must map to odd samples)")
-    parser.add_argument("--sg_polyorder", type=int, default=DEFAULT_SG_POLYORDER,
-                        help="Savitzky–Golay polynomial order (e.g., 2 or 3)")
+    # Butterworth params
+    parser.add_argument("--butter_order", type=int, default=DEFAULT_BUTTER_ORDER, help="Butterworth filter order")
+    parser.add_argument("--butter_cut_hz", type=float, default=DEFAULT_BUTTER_CUTOFF_HZ, help="Butterworth cutoff frequency (Hz)")
 
     args = parser.parse_args()
 
@@ -231,7 +233,7 @@ if __name__ == "__main__":
         window_min=args.window_min,
         stride_min=args.stride_min,
         keep_time=args.keep_time,
-        sg_window_ms=args.sg_window_ms,
-        sg_polyorder=args.sg_polyorder,
+        butter_order=args.butter_order,
+        butter_cutoff_hz=args.butter_cut_hz,
         start_index=args.start_index,
     )
