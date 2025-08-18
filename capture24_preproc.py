@@ -157,7 +157,7 @@ def preprocess_file(
         chunk_start_str = chunk_start_time.strftime("%Y%m%dT%H%M%S")
 
         # Choose columns to save
-        save_cols = (["time"] if keep_time else []) + ["x", "y", "z", "ENMO", "activity", "MET"]
+        save_cols = (["time"] if keep_time else []) + ["x", "y", "z", "ENMO", "activity", "MET"] ## drop enmo, activity, MET, generate separate labels file for this chunk with activity present
         save_df = chunk_df.drop(columns=["annotation"], errors="ignore")[save_cols]
 
         # Write parquet
