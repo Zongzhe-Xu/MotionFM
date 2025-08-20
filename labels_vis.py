@@ -25,6 +25,47 @@ def analyze_labels(label_dir: Path, output_dir: Path):
 
     full_df = pd.concat(all_labels, ignore_index=True)
 
+        # Step: Activity distribution per patient
+    print("Calculating activity distributions per patient...")
+
+    # Count all activity occurrences per patient
+    patient_activity_counts = full_df.groupby("patient_id")["activity_fractions"].apply(list)
+
+    # Merge all JSON activity_fractions into a single Counter per patient
+    patient_activity_distributions = {}
+    for patient, act_lists in patient_activity_counts.items():
+        counter = Counter()
+        for af in act_lists:
+            if isinstance(af, str):
+                af = json.loads(af)
+            counter.update(af)
+        total = sum(counter.values())
+        # Normalize to fractions
+        patient_activity_distributions[patient] = {k: v / total for k, v in counter.items()}
+
+    # Convert to dataframe for visualization
+    activity_df = pd.DataFrame.from_dict(patient_activity_distributions, orient="index").fillna(0)
+
+    # Save to CSV for inspection
+    activity_df.to_csv(output_dir / "activity_distribution_by_patient.csv")
+
+    # Plot stacked bar chart of top activities
+    top_activities = activity_df.sum().sort_values(ascending=False).head(10).index
+    activity_df_top = activity_df[top_activities]
+
+    plt.figure(figsize=(12, 6))
+    activity_df_top.sort_index().plot(kind="bar", stacked=True, figsize=(14, 6), width=0.8)
+    plt.title("Top Activity Fractions by Patient")
+    plt.ylabel("Fraction of Time")
+    plt.xlabel("Patient ID")
+    plt.xticks([], [])  # Hide xtick labels if too many
+    plt.legend(title="Activity", bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig(output_dir / "activity_distribution_by_patient.png")
+    plt.close()
+
+    print("Saved per-patient activity distribution plots.")
+
     # ---------------------------
     # Top 10 Activities by Chunk
     # ---------------------------
