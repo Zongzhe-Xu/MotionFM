@@ -3,117 +3,69 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from datetime import timedelta
+import json
+
+CHUNK_SIZE = 60 * 60 * 10   # 1 hour at 10 Hz
+STRIDE_SIZE = 15 * 60 * 10  # 15 minutes at 10 Hz
 
 
-def load_label_dictionary(label_dict_path: Path) -> dict:
-    df = pd.read_csv(label_dict_path)
-    return dict(zip(df["annotation"], df["label:WillettsSpecific2018"]))
+def load_label_mapping(csv_path):
+    df = pd.read_csv(csv_path)
+    return dict(zip(df['label:RawAnnotation'], df['label:WillettsSpecific2018']))
 
 
-def map_annotation_to_label(annotation_str: str, label_map: dict) -> str:
-    if not isinstance(annotation_str, str) or annotation_str.strip() == "":
-        return "none"
-    base_annotation = annotation_str.split(";")[0].strip()
-    return label_map.get(base_annotation, "none")
+def one_hot_encode_activities(chunk_activities, all_activities):
+    flags = {act: 0 for act in all_activities}
+    for act in chunk_activities:
+        if act in flags:
+            flags[act] = 1
+    return flags
 
 
-def process_raw_file(
-    input_file: Path,
-    label_map: dict,
-    output_dir: Path,
-    chunk_length_seconds: int = 3600,
-    stride_seconds: int = 900,
-    sampling_rate: int = 100,
-):
-    df = pd.read_parquet(input_file, columns=["time", "annotation"])
+def process_single_file(file_path, output_dir, label_map, all_activities):
+    df = pd.read_parquet(file_path, columns=["time", "annotation"])
+    df["activity"] = df["annotation"].map(label_map).fillna("none")
 
-    # Map annotations to WillettsSpecific2018 labels
-    df["activity"] = df["annotation"].apply(lambda x: map_annotation_to_label(x, label_map))
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.drop(columns=["annotation"])
+    data = []
+    for start in range(0, len(df) - CHUNK_SIZE + 1, STRIDE_SIZE):
+        chunk = df.iloc[start:start + CHUNK_SIZE]
+        top_act = chunk["activity"].mode().iloc[0] if not chunk.empty else "none"
+        unique_acts = chunk["activity"].unique()
+        binary_flags = one_hot_encode_activities(unique_acts, all_activities)
+        data.append({
+            "patient_id": file_path.stem,
+            "start_index": start,
+            "most_common_activity": top_act,
+            **binary_flags
+        })
 
-    # Set time as index
-    df = df.set_index("time")
-    df = df.sort_index()
-
-    # Chunking into 1-hour windows, 15-min stride
-    chunks = []
-    start_time = df.index.min()
-    end_time = df.index.max()
-    delta = timedelta(seconds=chunk_length_seconds)
-    stride = timedelta(seconds=stride_seconds)
-
-    unique_activities = sorted(set(label_map.values()) | {"none"})
-
-    while start_time + delta <= end_time:
-        chunk = df.loc[start_time : start_time + delta]
-        if not chunk.empty:
-            activity_counts = chunk["activity"].value_counts()
-            top_activity = activity_counts.idxmax()
-
-            row = {
-                "start_time": start_time,
-                "end_time": start_time + delta,
-                "top_activity": top_activity,
-            }
-
-            for act in unique_activities:
-                row[act] = int(act in activity_counts)
-
-            chunks.append(row)
-        start_time += stride
-
-    # Output
-    output_df = pd.DataFrame(chunks)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"{input_file.stem}_labels.parquet"
-    output_df.to_parquet(output_file, index=False)
-    print(f"Saved {output_file.name} with {len(output_df)} chunks")
+    out_df = pd.DataFrame(data)
+    output_file = output_dir / f"{file_path.stem}_labels.parquet"
+    out_df.to_parquet(output_file, index=False)
+    print(f"Saved: {output_file.name}")
 
 
-def batch_process(
-    input_dir: Path,
-    output_dir: Path,
-    label_dict_path: Path,
-    chunk_length_seconds: int = 3600,
-    stride_seconds: int = 900,
-    sampling_rate: int = 100,
-):
-    label_map = load_label_dictionary(label_dict_path)
-    files = sorted(input_dir.glob("*.parquet"))
-    print(f"Found {len(files)} raw parquet files")
+def batch_process(input_dir, output_dir, label_dict_csv, start_index=0):
+    label_map = load_label_mapping(label_dict_csv)
+    all_activities = sorted(set(label_map.values()) | {"none"})
 
-    for file in tqdm(files, desc="Processing files"):
+    input_files = sorted(input_dir.glob("*.parquet"))
+    files_to_process = input_files[start_index:]
+    print(f"Found {len(files_to_process)} files to process starting from index {start_index}")
+
+    for file in tqdm(files_to_process, desc="Processing files"):
         try:
-            process_raw_file(
-                input_file=file,
-                label_map=label_map,
-                output_dir=output_dir,
-                chunk_length_seconds=chunk_length_seconds,
-                stride_seconds=stride_seconds,
-                sampling_rate=sampling_rate,
-            )
+            process_single_file(file, output_dir, label_map, all_activities)
         except Exception as e:
-            print(f"Failed to process {file.name}: {e}")
+            print(f"Error processing {file.name}: {e}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chunk and summarize raw annotation labels.")
-    parser.add_argument("--input_dir", required=True, help="Directory with raw Capture24 parquet files")
-    parser.add_argument("--output_dir", required=True, help="Directory to save chunked label summaries")
-    parser.add_argument("--label_dict", required=True, help="CSV file mapping annotation to WillettsSpecific2018 labels")
-    parser.add_argument("--chunk_length", type=int, default=3600, help="Chunk length in seconds (default: 3600)")
-    parser.add_argument("--stride", type=int, default=900, help="Stride in seconds between chunks (default: 900)")
-    parser.add_argument("--sampling_rate", type=int, default=100, help="Sampling rate of raw data (Hz)")
+    parser = argparse.ArgumentParser(description="Generate per-chunk activity labels from raw parquets.")
+    parser.add_argument("--input_dir", required=True, help="Path to raw parquet files")
+    parser.add_argument("--output_dir", required=True, help="Path to save chunked label files")
+    parser.add_argument("--label_dict", required=True, help="Path to annotation-label-dictionary.csv")
+    parser.add_argument("--start_index", type=int, default=0, help="Start index for file processing")
 
     args = parser.parse_args()
-
-    batch_process(
-        input_dir=Path(args.input_dir),
-        output_dir=Path(args.output_dir),
-        label_dict_path=Path(args.label_dict),
-        chunk_length_seconds=args.chunk_length,
-        stride_seconds=args.stride,
-        sampling_rate=args.sampling_rate,
-    )
+    batch_process(Path(args.input_dir), Path(args.output_dir), Path(args.label_dict), args.start_index)
