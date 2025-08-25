@@ -11,7 +11,7 @@ STRIDE_SIZE = 15 * 60 * 10  # 15 minutes at 10 Hz
 
 def load_label_mapping(csv_path):
     df = pd.read_csv(csv_path)
-    return dict(zip(df['label:annotation'], df['label:WillettsSpecific2018']))
+    return dict(zip(df['annotation'], df['label:WillettsSpecific2018']))
 
 
 def one_hot_encode_activities(chunk_activities, all_activities):
